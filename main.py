@@ -9,11 +9,16 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 app = FastAPI(title="Link Extractor API")
 
-processing_lock = asyncio.Lock()
-DOWNLOAD_TIMEOUT = 15 # Reduced timeout since we are acting faster
+# ------------------ Global driver (reused across requests) ------------------
+_driver = None
+_driver_lock = asyncio.Lock()
+processing_lock = asyncio.Lock()   # ensures only one request uses the driver at a time
+
+DOWNLOAD_TIMEOUT = 10  # reduced from 15s
 
 _AGGRESSIVE_JS = """
 (function() {
@@ -34,7 +39,7 @@ _AGGRESSIVE_JS = """
             btn.disabled = false;
             btn.removeAttribute('disabled');
         });
-    }, 10); // Sped up the interval from 50ms to 10ms
+    }, 50);  // reduced frequency to save CPU
 })();
 """
 
@@ -42,34 +47,36 @@ class UrlRequest(BaseModel):
     url: HttpUrl
 
 def get_driver():
-    options = webdriver.ChromeOptions()
-    # OPTIMIZATION 1: 'eager' stops Selenium from waiting for heavy ads/iframes to load
-    options.page_load_strategy = 'eager' 
-    
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--blink-settings=imagesEnabled=false")
-    options.add_argument("--mute-audio")
-    
-    if os.path.exists("/usr/bin/chromium-browser"):
-        options.binary_location = "/usr/bin/chromium-browser"
-    elif os.path.exists("/usr/bin/chromium"):
-        options.binary_location = "/usr/bin/chromium"
+    global _driver
+    if _driver is None:
+        options = webdriver.ChromeOptions()
+        options.page_load_strategy = 'eager'   # don't wait for all resources
 
-    prefs = {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.managed_default_content_settings.stylesheets": 2, # Block CSS to load faster
-    }
-    options.add_experimental_option("prefs", prefs)
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    
-    driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(15)
-    return driver
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
+        options.add_argument("--blink-settings=imagesEnabled=false")
+        options.add_argument("--mute-audio")
+
+        if os.path.exists("/usr/bin/chromium-browser"):
+            options.binary_location = "/usr/bin/chromium-browser"
+        elif os.path.exists("/usr/bin/chromium"):
+            options.binary_location = "/usr/bin/chromium"
+
+        prefs = {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.managed_default_content_settings.stylesheets": 2,
+        }
+        options.add_experimental_option("prefs", prefs)
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+
+        _driver = webdriver.Chrome(options=options)
+        _driver.set_page_load_timeout(12)   # slightly lower than before
+        _driver.set_script_timeout(10)
+    return _driver
 
 def wait_cdp_download(driver, timeout):
     deadline = time.time() + timeout
@@ -79,18 +86,15 @@ def wait_cdp_download(driver, timeout):
         try:
             logs = driver.get_log("performance")
         except Exception:
-            # OPTIMIZATION 2: Poll much faster (every 0.05s instead of 0.2s)
-            time.sleep(0.05) 
+            time.sleep(0.05)
             continue
         for entry in logs:
             try:
                 msg = json.loads(entry["message"]).get("message", {})
                 method = msg.get("method", "")
                 params = msg.get("params", {})
-                
                 if method == "Page.downloadWillBegin":
                     return params.get("url", "")
-                    
                 if method in ("Network.requestWillBeSent", "Network.responseReceived"):
                     url = params.get("request", {}).get("url", "") if method == "Network.requestWillBeSent" else params.get("response", {}).get("url", "")
                     if not url or url in seen:
@@ -104,53 +108,58 @@ def wait_cdp_download(driver, timeout):
     return None
 
 def execute_extraction(url: str):
-    driver = None
+    driver = get_driver()   # reused driver
+
     try:
-        driver = get_driver()
+        # Inject timer killer before navigation
         try:
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _AGGRESSIVE_JS})
         except Exception:
             pass
 
         driver.get(url)
-        
-        # OPTIMIZATION 3: Removed the static document.readyState wait. 
-        # We jump straight into looking for the buttons.
+
+        # ---- Click sequence with reduced timeouts (2s each) ----
         try:
-            # Step 1
-            btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "//button[@id='method_free']")))
-            driver.execute_script("arguments[0].click();", btn)
-            # Step 2
-            btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Free Download')]")))
-            driver.execute_script("arguments[0].click();", btn)
-            # Step 3
-            btn = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Start Download')]")))
+            btn = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, "//button[@id='method_free']")))
             driver.execute_script("arguments[0].click();", btn)
         except TimeoutException:
-            pass # If it times out, it might have already progressed to the download log phase
+            pass
 
         try:
-            driver.get_log("performance") # clear old logs quickly
+            btn = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Free Download')]")))
+            driver.execute_script("arguments[0].click();", btn)
+        except TimeoutException:
+            pass
+
+        try:
+            btn = WebDriverWait(driver, 2).until(EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Start Download')]")))
+            driver.execute_script("arguments[0].click();", btn)
+        except TimeoutException:
+            pass
+
+        # Clear old logs
+        try:
+            driver.get_log("performance")
         except Exception:
             pass
-            
+
         dl_url = wait_cdp_download(driver, timeout=DOWNLOAD_TIMEOUT)
         if dl_url:
             return {"status": "success", "original_url": url, "download_url": dl_url}
         else:
-            raise HTTPException(status_code=404, detail="Failed to capture download link fast enough")
+            raise HTTPException(status_code=404, detail="Download URL not captured within timeout")
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 @app.post("/extract")
 async def extract_url(payload: UrlRequest):
-    async with processing_lock:
+    async with processing_lock:          # only one request at a time
+        # Run the synchronous extraction in a thread to avoid blocking the event loop
         result = await asyncio.to_thread(execute_extraction, str(payload.url))
         return result
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
