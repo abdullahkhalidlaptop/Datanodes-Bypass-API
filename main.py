@@ -4,8 +4,11 @@ import time
 import asyncio
 import re
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -43,39 +46,64 @@ CACHE_TTL_SECONDS = 3600
 # ---------- Selenium globals ----------
 _driver = None
 processing_lock = asyncio.Lock()
-DOWNLOAD_TIMEOUT = 20  # increased from 10
+DOWNLOAD_TIMEOUT = 25   # same as original
 
+# ---------- Aggressive timer killer (exactly as in full.py) ----------
 _AGGRESSIVE_JS = """
 (function() {
     if (window.__timerBypassDone) return;
     window.__timerBypassDone = true;
+
     const _st = window.setTimeout;
     const _si = window.setInterval;
-    window.setTimeout = function(fn, d, ...a) { if (typeof d === 'number' && d > 50) d = 1; return _st(fn, d, ...a); };
-    window.setInterval = function(fn, d, ...a) { if (typeof d === 'number' && d > 50) d = 1; return _si(fn, d, ...a); };
+    window.setTimeout = function(fn, d, ...a) {
+        if (typeof d === 'number' && d > 50) d = 1;
+        return _st(fn, d, ...a);
+    };
+    window.setInterval = function(fn, d, ...a) {
+        if (typeof d === 'number' && d > 50) d = 1;
+        return _si(fn, d, ...a);
+    };
+
     setInterval(function() {
         ['downloadCountdown','countdown','seconds','count','wait','timer','countdownNum','timerValue','timeLeft'].forEach(varName => {
-            if (typeof window[varName] !== 'undefined' && typeof window[varName] === 'number' && window[varName] > 0) window[varName] = 0;
+            if (typeof window[varName] !== 'undefined' && typeof window[varName] === 'number' && window[varName] > 0) {
+                window[varName] = 0;
+            }
         });
         document.querySelectorAll('[class*="countdown"], [class*="timer"], [class*="seconds"]').forEach(el => {
-            if (el.textContent && /^\\d+$/.test(el.textContent.trim()) && parseInt(el.textContent.trim()) > 0) el.textContent = '0';
+            if (el.textContent && /^\\d+$/.test(el.textContent.trim()) && parseInt(el.textContent.trim()) > 0) {
+                el.textContent = '0';
+            }
         });
         document.querySelectorAll('button[disabled]').forEach(btn => {
-            btn.disabled = false;
-            btn.removeAttribute('disabled');
+            if (btn.textContent.includes('Free Download') || btn.textContent.includes('Start Download') || btn.textContent.includes('Continue')) {
+                btn.disabled = false;
+                btn.removeAttribute('disabled');
+            }
         });
     }, 50);
+
+    const _raf = window.requestAnimationFrame;
+    window.requestAnimationFrame = function(cb) {
+        return _raf(cb);
+    };
+    const originalSetInterval = window.setInterval;
+    window.setInterval = function(fn, d, ...a) {
+        if (typeof d === 'number' && d > 50) d = 1;
+        return originalSetInterval(fn, d, ...a);
+    };
 })();
 """
 
 class UrlRequest(BaseModel):
     url: HttpUrl
 
-# ---------- Helper ----------
+# ---------- Helper: sanitise URL for Firestore ----------
 def sanitise_doc_id(url: str) -> str:
     return url.replace('/', '_').replace('.', '_').replace('#', '_').replace('$', '_').replace('[', '_').replace(']', '_')
 
-# ---------- Cache ----------
+# ---------- Cache functions ----------
 def get_cached(url: str):
     if use_firebase and db:
         doc_ref = db.collection('link_cache').document(sanitise_doc_id(url))
@@ -112,21 +140,23 @@ def delete_cached(url: str):
     else:
         memory_cache.pop(url, None)
 
-# ---------- Driver ----------
+# ---------- Driver creation (mimics get_driver from full.py) ----------
 def get_driver():
     global _driver
     if _driver is None:
         print("🔄 Creating new Chrome driver...")
         options = webdriver.ChromeOptions()
-        options.page_load_strategy = 'eager'
+        options.page_load_strategy = 'normal'   # same as original
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--disable-extensions")
+        options.add_argument("--window-size=1280,720")
         options.add_argument("--blink-settings=imagesEnabled=false")
         options.add_argument("--mute-audio")
 
+        # Chromium binary location (for Render)
         if os.path.exists("/usr/bin/chromium-browser"):
             options.binary_location = "/usr/bin/chromium-browser"
         elif os.path.exists("/usr/bin/chromium"):
@@ -135,28 +165,52 @@ def get_driver():
         prefs = {
             "profile.managed_default_content_settings.images": 2,
             "profile.default_content_setting_values.notifications": 2,
-            "profile.managed_default_content_settings.stylesheets": 2,
+            "profile.managed_default_content_settings.plugins": 2,
         }
         options.add_experimental_option("prefs", prefs)
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
         _driver = webdriver.Chrome(options=options)
-        _driver.set_page_load_timeout(15)
-        _driver.set_script_timeout(10)
+        _driver.set_page_load_timeout(25)
         print("✅ Driver created.")
     return _driver
 
-# ---------- CDN capture with enhanced logging ----------
-def wait_cdp_download(driver, timeout, url):
-    print(f"🔍 Monitoring network logs for download URL... (timeout={timeout}s)")
+# ---------- Enable download events (CDP) ----------
+def enable_download_events(driver):
+    try:
+        driver.execute_cdp_cmd("Page.enable", {})
+        driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": "/tmp",   # not used, but required
+            "eventsEnabled": True
+        })
+    except Exception:
+        pass
+
+# ---------- Inject timer killer ----------
+def inject_timer_killer(driver):
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _AGGRESSIVE_JS})
+    except Exception as e:
+        print(f"⚠️ Timer killer injection failed: {e}")
+
+# ---------- Wait for page load (same as full.py) ----------
+def wait_for_page_load(driver, timeout=15):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
+    )
+
+# ---------- CDP download capture (exact copy from full.py) ----------
+def wait_cdp_download(driver, timeout, worker_id=0):
     deadline = time.time() + timeout
     seen = set()
+    skip = {"doubleclick", "google", "gstatic", "cloudflare", "facebook", "analytics"}
     exts = (".rar", ".zip", ".7z", ".exe", ".part", ".iso", ".mkv", ".mp4", ".bin")
     while time.time() < deadline:
         try:
             logs = driver.get_log("performance")
-        except Exception as e:
-            time.sleep(0.05)
+        except Exception:
+            time.sleep(0.1)
             continue
         for entry in logs:
             try:
@@ -164,35 +218,39 @@ def wait_cdp_download(driver, timeout, url):
                 method = msg.get("method", "")
                 params = msg.get("params", {})
                 if method == "Page.downloadWillBegin":
-                    dl_url = params.get("url", "")
-                    print(f"🔗 Download will begin: {dl_url}")
-                    return dl_url
+                    url = params.get("url", "")
+                    if url:
+                        return url
                 if method in ("Network.requestWillBeSent", "Network.responseReceived"):
                     if method == "Network.requestWillBeSent":
-                        dl_url = params.get("request", {}).get("url", "")
+                        url = params.get("request", {}).get("url", "")
                     else:
-                        dl_url = params.get("response", {}).get("url", "")
-                    if not dl_url or dl_url in seen:
+                        resp = params.get("response", {})
+                        url = resp.get("url", "")
+                    if not url or url in seen:
                         continue
-                    seen.add(dl_url)
-                    # Check if it's a likely download
-                    if any(dl_url.lower().endswith(ext) for ext in exts) or any(ext in dl_url.lower() for ext in exts):
-                        print(f"🔗 Found download URL via network: {dl_url}")
-                        return dl_url
-                    # Check content-disposition / content-type
+                    seen.add(url)
+                    if any(s in url for s in skip):
+                        continue
+                    if url.lower().endswith(exts) or any(e in url.lower() for e in exts):
+                        return url
                     headers = params.get("response", {}).get("headers", {}) if method == "Network.responseReceived" else {}
                     cd = headers.get("content-disposition", "") or headers.get("Content-Disposition", "")
                     ct = headers.get("content-type", "") or headers.get("Content-Type", "")
                     if "attachment" in cd.lower() or "octet-stream" in ct.lower():
-                        print(f"🔗 Found attachment URL via headers: {dl_url}")
-                        return dl_url
+                        return url
             except Exception:
                 continue
-        time.sleep(0.05)
-    print("⚠️ No download URL found in performance logs.")
+        time.sleep(0.1)
     return None
 
-# ---------- Extract file info (unchanged) ----------
+def drain_logs(driver):
+    try:
+        driver.get_log("performance")
+    except Exception:
+        pass
+
+# ---------- Extract file info (from page) ----------
 def extract_file_info(driver):
     try:
         container = WebDriverWait(driver, 3).until(
@@ -214,84 +272,72 @@ def extract_file_info(driver):
     except Exception:
         return None, None
 
-# ---------- Core extraction ----------
+# ---------- Core extraction (mirrors process_single_url from full.py) ----------
 def execute_extraction(url: str):
     print(f"🚀 Starting extraction for: {url}")
     driver = get_driver()
     try:
-        # Inject timer killer
-        try:
-            driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": _AGGRESSIVE_JS})
-            print("✅ Timer killer script injected.")
-        except Exception as e:
-            print(f"⚠️ Failed to inject timer killer: {e}")
+        # Enable download events & inject timer killer
+        enable_download_events(driver)
+        inject_timer_killer(driver)
 
-        print("🌐 Navigating to URL...")
         driver.get(url)
+        wait_for_page_load(driver, timeout=15)
 
-        # Wait for page load
-        WebDriverWait(driver, 15).until(
-            lambda d: d.execute_script("return document.readyState") in ["interactive", "complete"]
-        )
-        print("✅ Page loaded.")
-
-        # ---- Click sequence with logging ----
-        # 1. Continue (method_free)
+        # ---- 1. Continue - FORCED (no wait for clickable, just presence) ----
         try:
-            btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, "//button[@id='method_free']")))
-            driver.execute_script("arguments[0].click();", btn)
-            print("✅ Clicked 'Continue' (method_free).")
-        except TimeoutException:
-            print("⏳ 'Continue' button not found or not clickable – might already be past that step.")
+            btn = WebDriverWait(driver, 0.5).until(
+                EC.presence_of_element_located((By.XPATH, "//button[@id='method_free']"))
+            )
+            driver.execute_script("""
+                arguments[0].disabled = false;
+                arguments[0].removeAttribute('disabled');
+                arguments[0].removeAttribute('hidden');
+                arguments[0].style.display = 'block';
+                arguments[0].style.visibility = 'visible';
+                arguments[0].click();
+            """, btn)
+            print("✅ Forced Continue")
+        except Exception as e:
+            print(f"⚠️ Continue click failed: {e}")
 
-        # 2. Free Download
+        # ---- 2. Free Download - FORCED ----
         try:
-            btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Free Download')]")))
-            driver.execute_script("arguments[0].click();", btn)
-            print("✅ Clicked 'Free Download'.")
-        except TimeoutException:
-            print("⏳ 'Free Download' button not found or not clickable.")
+            btn = WebDriverWait(driver, 0.5).until(
+                EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Free Download')]"))
+            )
+            driver.execute_script("""
+                arguments[0].disabled = false;
+                arguments[0].removeAttribute('disabled');
+                arguments[0].click();
+            """, btn)
+            print("✅ Forced Free Download")
+        except Exception as e:
+            print(f"⚠️ Free Download click failed: {e}")
 
-        # 3. Start Download
+        # ---- 3. Start Download - FORCED ----
         try:
-            btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Start Download')]")))
-            driver.execute_script("arguments[0].click();", btn)
-            print("✅ Clicked 'Start Download'.")
-        except TimeoutException:
-            print("⏳ 'Start Download' button not found or not clickable.")
+            btn = WebDriverWait(driver, 0.5).until(
+                EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Start Download')]"))
+            )
+            driver.execute_script("""
+                arguments[0].disabled = false;
+                arguments[0].removeAttribute('disabled');
+                arguments[0].click();
+            """, btn)
+            print("✅ Forced Start Download")
+        except Exception as e:
+            print(f"⚠️ Start Download click failed: {e}")
 
-        # ---- Wait a moment for the download to trigger ----
-        time.sleep(2)
+        # ---- Capture download URL ----
+        drain_logs(driver)
+        dl_url = wait_cdp_download(driver, timeout=DOWNLOAD_TIMEOUT, worker_id=0)
 
-        # ---- Extract file info ----
+        # ---- Extract file info (can be done anytime) ----
         file_name, file_size = extract_file_info(driver)
-        print(f"📄 Extracted file info: name='{file_name}', size='{file_size}'")
-
-        # ---- Clear old logs and capture ----
-        try:
-            driver.get_log("performance")
-        except Exception:
-            pass
-
-        dl_url = wait_cdp_download(driver, timeout=DOWNLOAD_TIMEOUT, url=url)
-
-        # If still not found, try to find a direct link on the page
-        if not dl_url:
-            print("🔍 Attempting to find download link in page source...")
-            try:
-                # Look for any <a> tag with href containing file extensions
-                links = driver.find_elements(By.XPATH, "//a[contains(@href, '.rar') or contains(@href, '.zip') or contains(@href, '.7z') or contains(@href, '.exe')]")
-                for link in links:
-                    href = link.get_attribute("href")
-                    if href:
-                        dl_url = href
-                        print(f"🔗 Found download link in <a> tag: {dl_url}")
-                        break
-            except Exception:
-                pass
 
         if dl_url:
-            print(f"✅ Successfully captured download URL: {dl_url[:100]}...")
+            print(f"✅ Captured: {dl_url[:100]}...")
             return {
                 "status": "success",
                 "original_url": url,
@@ -300,14 +346,31 @@ def execute_extraction(url: str):
                 "bypassed_url": dl_url
             }
         else:
-            print("❌ Failed to capture any download URL.")
+            print("❌ No download URL captured.")
+            # Try to find a direct link as fallback
+            try:
+                links = driver.find_elements(By.XPATH, "//a[contains(@href, '.rar') or contains(@href, '.zip') or contains(@href, '.7z')]")
+                for link in links:
+                    href = link.get_attribute("href")
+                    if href:
+                        dl_url = href
+                        print(f"🔗 Found fallback link: {dl_url}")
+                        return {
+                            "status": "success",
+                            "original_url": url,
+                            "name": file_name,
+                            "size": file_size,
+                            "bypassed_url": dl_url
+                        }
+            except:
+                pass
             raise HTTPException(status_code=404, detail="Download URL not captured within timeout")
 
     except Exception as e:
-        print(f"❌ Exception in execute_extraction: {str(e)}")
+        print(f"❌ Extraction failed: {e}")
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
-# ---------- API endpoints ----------
+# ---------- FastAPI endpoints ----------
 @app.post("/extract")
 async def extract_url(payload: UrlRequest, reload: bool = Query(False)):
     url_str = str(payload.url)
@@ -319,6 +382,7 @@ async def extract_url(payload: UrlRequest, reload: bool = Query(False)):
         return cached
 
     async with processing_lock:
+        # Double-check cache after lock
         cached = get_cached(url_str)
         if cached:
             return cached
