@@ -38,7 +38,7 @@ else:
 
 # ---------- Cache ----------
 memory_cache = {}
-CACHE_TTL_SECONDS = 3600
+CACHE_TTL_SECONDS = 43200
 
 def sanitise_doc_id(url: str) -> str:
     return url.replace('/', '_').replace('.', '_').replace('#', '_').replace('$', '_').replace('[', '_').replace(']', '_')
