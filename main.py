@@ -238,44 +238,49 @@ def extract_file_info(driver):
     name = None
     size = None
 
-    # Try structure 1: div with flex items (icon, name, size, verified)
+    # Target the exact structure: div.min-w-0.flex-1 containing two p tags
     try:
         container = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.min-w-0.flex-1"))
         )
         paragraphs = container.find_elements(By.TAG_NAME, "p")
         if len(paragraphs) >= 2:
             name = paragraphs[0].text.strip()
             size = paragraphs[1].text.strip()
-        else:
-            for p in paragraphs:
-                text = p.text.strip()
-                if "MB" in text or "GB" in text or "KB" in text:
-                    size = text
-                elif text and not text.startswith("Verified"):
-                    name = text
-        if name and size:
-            return name, size
+            if name and size:
+                return name, size
     except:
         pass
 
-    # Try structure 2: w-full md:w-6/12 (h2 for name, p for size)
+    # Fallback 1: try outer flex container with mb-4
     try:
         container = WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'w-full md:w-6/12')]"))
+            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]"))
         )
-        h2 = container.find_element(By.TAG_NAME, "h2")
-        if h2:
-            name = h2.text.strip()
-        p = container.find_element(By.TAG_NAME, "p")
-        if p:
-            size = p.text.strip()
-        if name and size:
-            return name, size
+        inner = container.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+        paragraphs = inner.find_elements(By.TAG_NAME, "p")
+        if len(paragraphs) >= 2:
+            name = paragraphs[0].text.strip()
+            size = paragraphs[1].text.strip()
+            if name and size:
+                return name, size
     except:
         pass
 
-    # Fallback: page title or any MB/GB text
+    # Fallback 2: any div with flex-1 that has two p children
+    try:
+        containers = driver.find_elements(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+        for container in containers:
+            paragraphs = container.find_elements(By.TAG_NAME, "p")
+            if len(paragraphs) >= 2:
+                name = paragraphs[0].text.strip()
+                size = paragraphs[1].text.strip()
+                if name and size:
+                    return name, size
+    except:
+        pass
+
+    # Fallback 3: page title or any MB/GB text
     try:
         if not name:
             title = driver.title
