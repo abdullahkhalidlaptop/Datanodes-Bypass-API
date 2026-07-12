@@ -268,9 +268,24 @@ def extract_file_info(driver):
     name = None
     size = None
 
-    # 1. Exact structure: div.min-w-0.flex-1 with two p tags (the most reliable)
+    # 1. Use the exact CSS selectors you provided (most reliable)
     try:
-        container = WebDriverWait(driver, 5).until(
+        # Wait for the name element to be present
+        name_elem = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700.m-0.truncate"))
+        )
+        name = name_elem.text.strip()
+        # Size element: p.text-\[11px\].text-slate-400.m-0.mt-0.5
+        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400.m-0.mt-0.5")
+        size = size_elem.text.strip()
+        if name and size:
+            return name, size
+    except Exception as e:
+        print(f"⚠️ Exact selector extraction failed: {e}")
+
+    # 2. Fallback: div.min-w-0.flex-1 with two p tags
+    try:
+        container = WebDriverWait(driver, 3).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.min-w-0.flex-1"))
         )
         paragraphs = container.find_elements(By.TAG_NAME, "p")
@@ -282,29 +297,7 @@ def extract_file_info(driver):
     except:
         pass
 
-    # 2. More specific XPath for the name and size p tags
-    try:
-        name_elem = driver.find_element(By.XPATH, "//div[contains(@class, 'min-w-0 flex-1')]/p[1]")
-        name = name_elem.text.strip()
-        size_elem = driver.find_element(By.XPATH, "//div[contains(@class, 'min-w-0 flex-1')]/p[2]")
-        size = size_elem.text.strip()
-        if name and size:
-            return name, size
-    except:
-        pass
-
-    # 3. Use the exact class names you provided
-    try:
-        name_elem = driver.find_element(By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700")
-        name = name_elem.text.strip()
-        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400")
-        size = size_elem.text.strip()
-        if name and size:
-            return name, size
-    except:
-        pass
-
-    # 4. Fallback: outer container with gap-2.5 mb-4
+    # 3. Fallback: outer container and inner flex-1
     try:
         outer = driver.find_element(By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]")
         inner = outer.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
@@ -317,7 +310,7 @@ def extract_file_info(driver):
     except:
         pass
 
-    # 5. Last resort: find any element with MB/GB for size, and use page title for name
+    # 4. Last resort: page title and any MB/GB text
     try:
         if not name:
             title = driver.title
@@ -386,6 +379,15 @@ def execute_extraction(url: str):
 
         drain_logs(driver)
         dl_url = wait_cdp_download(driver, timeout=DOWNLOAD_TIMEOUT)
+
+        # Wait for the name element to appear before extracting
+        try:
+            WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700.m-0.truncate"))
+            )
+        except:
+            pass
+
         file_name, file_size = extract_file_info(driver)
 
         if dl_url:
