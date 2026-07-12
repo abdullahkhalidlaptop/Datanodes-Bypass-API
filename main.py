@@ -268,27 +268,26 @@ def extract_file_info(driver):
     name = None
     size = None
 
-    # 1. Extract Name independently
+    # 1. Extract Name independently using XPath (avoids escaping issues)
     try:
         name_elem = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700.m-0.truncate"))
-        )
-        # Use textContent to grab text even if visual rendering is delayed
+            EC.presence_of_element_located((By.XPATH, "//p[contains(@class, 'truncate') and contains(@class, 'text-slate-700')]"))
+    )
         name = name_elem.get_attribute("textContent").strip()
     except Exception as e:
-        print(f"⚠️ Exact name selector failed: {e}")
+        print(f"⚠️ Exact name selector failed: {type(e).__name__}")
 
-    # 2. Extract Size independently
+    # 2. Extract Size independently using XPath
     try:
-        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400.m-0.mt-0.5")
+        size_elem = driver.find_element(By.XPATH, "//p[contains(@class, 'text-slate-400') and contains(@class, 'mt-0.5')]")
         size = size_elem.get_attribute("textContent").strip()
     except Exception as e:
-        print(f"⚠️ Exact size selector failed: {e}")
+        print(f"⚠️ Exact size selector failed: {type(e).__name__}")
 
     # 3. Fallback: div.min-w-0.flex-1 with two p tags
     if not name or not size:
         try:
-            container = driver.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+            container = driver.find_element(By.XPATH, "//div[contains(@class, 'min-w-0') and contains(@class, 'flex-1')]")
             paragraphs = container.find_elements(By.TAG_NAME, "p")
             if len(paragraphs) >= 2:
                 if not name: name = paragraphs[0].get_attribute("textContent").strip()
@@ -296,24 +295,12 @@ def extract_file_info(driver):
         except:
             pass
 
-    # 4. Fallback: outer container and inner flex-1
-    if not name or not size:
-        try:
-            outer = driver.find_element(By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]")
-            inner = outer.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
-            paragraphs = inner.find_elements(By.TAG_NAME, "p")
-            if len(paragraphs) >= 2:
-                if not name: name = paragraphs[0].get_attribute("textContent").strip()
-                if not size: size = paragraphs[1].get_attribute("textContent").strip()
-        except:
-            pass
-
-    # 5. Last resort: page title and any MB/GB text
+    # 4. Last resort: page title and any MB/GB text
     if not name:
         try:
             title = driver.title
             if title:
-                name = title.strip()
+                name = title.replace("Download", "").strip()
         except:
             pass
 
@@ -330,37 +317,6 @@ def extract_file_info(driver):
 
     return name, size
 
-    # 3. Fallback: outer container and inner flex-1
-    try:
-        outer = driver.find_element(By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]")
-        inner = outer.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
-        paragraphs = inner.find_elements(By.TAG_NAME, "p")
-        if len(paragraphs) >= 2:
-            name = paragraphs[0].text.strip()
-            size = paragraphs[1].text.strip()
-            if name and size:
-                return name, size
-    except:
-        pass
-
-    # 4. Last resort: page title and any MB/GB text
-    try:
-        if not name:
-            title = driver.title
-            if title:
-                name = title.strip()
-        if not size:
-            elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'MB') or contains(text(), 'GB')]")
-            for el in elements:
-                text = el.text.strip()
-                if "MB" in text or "GB" in text or "KB" in text:
-                    size = text
-                    break
-    except:
-        pass
-
-    return name, size
-
 def execute_extraction(url: str):
     print(f"🚀 Starting extraction for: {url}")
     driver = get_driver()
@@ -370,6 +326,11 @@ def execute_extraction(url: str):
 
         driver.get(url)
         wait_for_page_load(driver, timeout=15)
+
+        # --- EXTRACT INFO FIRST (Before clicking buttons alters the page DOM) ---
+        print("🔍 Extracting file info...")
+        file_name, file_size = extract_file_info(driver)
+        print(f"📄 Found Name: {file_name} | Size: {file_size}")
 
         # 1. Continue
         try:
@@ -384,7 +345,7 @@ def execute_extraction(url: str):
             """, btn)
             print("✅ Forced Continue")
         except Exception as e:
-            print(f"⚠️ Continue click failed: {e}")
+            print(f"⚠️ Continue click failed: {type(e).__name__}")
 
         # 2. Free Download
         try:
@@ -396,7 +357,7 @@ def execute_extraction(url: str):
             """, btn)
             print("✅ Forced Free Download")
         except Exception as e:
-            print(f"⚠️ Free Download click failed: {e}")
+            print(f"⚠️ Free Download click failed: {type(e).__name__}")
 
         # 3. Start Download
         try:
@@ -408,20 +369,10 @@ def execute_extraction(url: str):
             """, btn)
             print("✅ Forced Start Download")
         except Exception as e:
-            print(f"⚠️ Start Download click failed: {e}")
+            print(f"⚠️ Start Download click failed: {type(e).__name__}")
 
         drain_logs(driver)
         dl_url = wait_cdp_download(driver, timeout=DOWNLOAD_TIMEOUT)
-
-        # Wait for the name element to appear before extracting
-        try:
-            WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700.m-0.truncate"))
-            )
-        except:
-            pass
-
-        file_name, file_size = extract_file_info(driver)
 
         if dl_url:
             print(f"✅ Captured: {dl_url[:100]}...")
