@@ -235,25 +235,63 @@ def drain_logs(driver):
         pass
 
 def extract_file_info(driver):
+    name = None
+    size = None
+
+    # Try structure 1: div with flex items (icon, name, size, verified)
     try:
-        container = WebDriverWait(driver, 3).until(
+        container = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]"))
         )
         paragraphs = container.find_elements(By.TAG_NAME, "p")
-        name = size = None
-        for p in paragraphs:
-            text = p.text.strip()
-            if text and ("MB" in text or "GB" in text or "KB" in text):
-                size = text
-            elif text and not text.startswith("Verified"):
-                name = text
-        if name is None and size is None:
-            p_texts = [p.text.strip() for p in paragraphs if p.text.strip()]
-            if len(p_texts) >= 2:
-                name, size = p_texts[0], p_texts[1]
-        return name, size
+        if len(paragraphs) >= 2:
+            name = paragraphs[0].text.strip()
+            size = paragraphs[1].text.strip()
+        else:
+            for p in paragraphs:
+                text = p.text.strip()
+                if "MB" in text or "GB" in text or "KB" in text:
+                    size = text
+                elif text and not text.startswith("Verified"):
+                    name = text
+        if name and size:
+            return name, size
     except:
-        return None, None
+        pass
+
+    # Try structure 2: w-full md:w-6/12 (h2 for name, p for size)
+    try:
+        container = WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'w-full md:w-6/12')]"))
+        )
+        h2 = container.find_element(By.TAG_NAME, "h2")
+        if h2:
+            name = h2.text.strip()
+        p = container.find_element(By.TAG_NAME, "p")
+        if p:
+            size = p.text.strip()
+        if name and size:
+            return name, size
+    except:
+        pass
+
+    # Fallback: page title or any MB/GB text
+    try:
+        if not name:
+            title = driver.title
+            if title:
+                name = title.strip()
+        if not size:
+            elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'MB') or contains(text(), 'GB')]")
+            for el in elements:
+                text = el.text.strip()
+                if "MB" in text or "GB" in text or "KB" in text:
+                    size = text
+                    break
+    except:
+        pass
+
+    return name, size
 
 def execute_extraction(url: str):
     print(f"🚀 Starting extraction for: {url}")
@@ -319,7 +357,7 @@ def execute_extraction(url: str):
             }
         else:
             print("❌ No download URL captured.")
-            # fallback
+            # fallback direct link
             try:
                 links = driver.find_elements(By.XPATH, "//a[contains(@href, '.rar') or contains(@href, '.zip') or contains(@href, '.7z')]")
                 for link in links:
