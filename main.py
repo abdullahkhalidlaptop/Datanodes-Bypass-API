@@ -234,11 +234,41 @@ def drain_logs(driver):
     except:
         pass
 
+def get_file_type(filename):
+    if not filename:
+        return "Unknown"
+    ext = filename.split('.')[-1].lower() if '.' in filename else ''
+    mapping = {
+        'rar': 'RAR File',
+        'zip': 'ZIP File',
+        '7z': '7-Zip File',
+        'exe': 'Executable File',
+        'iso': 'ISO Image',
+        'mkv': 'MKV Video',
+        'mp4': 'MP4 Video',
+        'bin': 'BIN File',
+        'part': 'Partial File',
+        'txt': 'Text File',
+        'pdf': 'PDF Document',
+        'doc': 'Word Document',
+        'docx': 'Word Document',
+        'xls': 'Excel Spreadsheet',
+        'xlsx': 'Excel Spreadsheet',
+        'jpg': 'JPEG Image',
+        'jpeg': 'JPEG Image',
+        'png': 'PNG Image',
+        'gif': 'GIF Image',
+        'mp3': 'MP3 Audio',
+        'wav': 'WAV Audio',
+        'flac': 'FLAC Audio',
+    }
+    return mapping.get(ext, f"{ext.upper()} File" if ext else "Unknown")
+
 def extract_file_info(driver):
     name = None
     size = None
 
-    # Target the exact structure: div.min-w-0.flex-1 containing two p tags
+    # 1. Exact structure: div.min-w-0.flex-1 with two p tags (the most reliable)
     try:
         container = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.min-w-0.flex-1"))
@@ -252,12 +282,32 @@ def extract_file_info(driver):
     except:
         pass
 
-    # Fallback 1: try outer flex container with mb-4
+    # 2. More specific XPath for the name and size p tags
     try:
-        container = WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]"))
-        )
-        inner = container.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+        name_elem = driver.find_element(By.XPATH, "//div[contains(@class, 'min-w-0 flex-1')]/p[1]")
+        name = name_elem.text.strip()
+        size_elem = driver.find_element(By.XPATH, "//div[contains(@class, 'min-w-0 flex-1')]/p[2]")
+        size = size_elem.text.strip()
+        if name and size:
+            return name, size
+    except:
+        pass
+
+    # 3. Use the exact class names you provided
+    try:
+        name_elem = driver.find_element(By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700")
+        name = name_elem.text.strip()
+        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400")
+        size = size_elem.text.strip()
+        if name and size:
+            return name, size
+    except:
+        pass
+
+    # 4. Fallback: outer container with gap-2.5 mb-4
+    try:
+        outer = driver.find_element(By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]")
+        inner = outer.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
         paragraphs = inner.find_elements(By.TAG_NAME, "p")
         if len(paragraphs) >= 2:
             name = paragraphs[0].text.strip()
@@ -267,20 +317,7 @@ def extract_file_info(driver):
     except:
         pass
 
-    # Fallback 2: any div with flex-1 that has two p children
-    try:
-        containers = driver.find_elements(By.CSS_SELECTOR, "div.min-w-0.flex-1")
-        for container in containers:
-            paragraphs = container.find_elements(By.TAG_NAME, "p")
-            if len(paragraphs) >= 2:
-                name = paragraphs[0].text.strip()
-                size = paragraphs[1].text.strip()
-                if name and size:
-                    return name, size
-    except:
-        pass
-
-    # Fallback 3: page title or any MB/GB text
+    # 5. Last resort: find any element with MB/GB for size, and use page title for name
     try:
         if not name:
             title = driver.title
@@ -353,11 +390,13 @@ def execute_extraction(url: str):
 
         if dl_url:
             print(f"✅ Captured: {dl_url[:100]}...")
+            file_type = get_file_type(file_name)
             return {
                 "status": "success",
                 "original_url": url,
                 "name": file_name,
                 "size": file_size,
+                "file_type": file_type,
                 "bypassed_url": dl_url
             }
         else:
@@ -368,11 +407,13 @@ def execute_extraction(url: str):
                 for link in links:
                     href = link.get_attribute("href")
                     if href:
+                        file_type = get_file_type(file_name)
                         return {
                             "status": "success",
                             "original_url": url,
                             "name": file_name,
                             "size": file_size,
+                            "file_type": file_type,
                             "bypassed_url": href
                         }
             except:
