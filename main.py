@@ -268,34 +268,67 @@ def extract_file_info(driver):
     name = None
     size = None
 
-    # 1. Use the exact CSS selectors you provided (most reliable)
+    # 1. Extract Name independently
     try:
-        # Wait for the name element to be present
         name_elem = WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "p.text-xs.font-medium.text-slate-700.m-0.truncate"))
         )
-        name = name_elem.text.strip()
-        # Size element: p.text-\[11px\].text-slate-400.m-0.mt-0.5
-        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400.m-0.mt-0.5")
-        size = size_elem.text.strip()
-        if name and size:
-            return name, size
+        # Use textContent to grab text even if visual rendering is delayed
+        name = name_elem.get_attribute("textContent").strip()
     except Exception as e:
-        print(f"⚠️ Exact selector extraction failed: {e}")
+        print(f"⚠️ Exact name selector failed: {e}")
 
-    # 2. Fallback: div.min-w-0.flex-1 with two p tags
+    # 2. Extract Size independently
     try:
-        container = WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.min-w-0.flex-1"))
-        )
-        paragraphs = container.find_elements(By.TAG_NAME, "p")
-        if len(paragraphs) >= 2:
-            name = paragraphs[0].text.strip()
-            size = paragraphs[1].text.strip()
-            if name and size:
-                return name, size
-    except:
-        pass
+        size_elem = driver.find_element(By.CSS_SELECTOR, "p.text-\\[11px\\].text-slate-400.m-0.mt-0.5")
+        size = size_elem.get_attribute("textContent").strip()
+    except Exception as e:
+        print(f"⚠️ Exact size selector failed: {e}")
+
+    # 3. Fallback: div.min-w-0.flex-1 with two p tags
+    if not name or not size:
+        try:
+            container = driver.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+            paragraphs = container.find_elements(By.TAG_NAME, "p")
+            if len(paragraphs) >= 2:
+                if not name: name = paragraphs[0].get_attribute("textContent").strip()
+                if not size: size = paragraphs[1].get_attribute("textContent").strip()
+        except:
+            pass
+
+    # 4. Fallback: outer container and inner flex-1
+    if not name or not size:
+        try:
+            outer = driver.find_element(By.XPATH, "//div[contains(@class, 'flex items-center gap-2.5 mb-4')]")
+            inner = outer.find_element(By.CSS_SELECTOR, "div.min-w-0.flex-1")
+            paragraphs = inner.find_elements(By.TAG_NAME, "p")
+            if len(paragraphs) >= 2:
+                if not name: name = paragraphs[0].get_attribute("textContent").strip()
+                if not size: size = paragraphs[1].get_attribute("textContent").strip()
+        except:
+            pass
+
+    # 5. Last resort: page title and any MB/GB text
+    if not name:
+        try:
+            title = driver.title
+            if title:
+                name = title.strip()
+        except:
+            pass
+
+    if not size:
+        try:
+            elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'MB') or contains(text(), 'GB')]")
+            for el in elements:
+                text = el.get_attribute("textContent").strip()
+                if "MB" in text or "GB" in text or "KB" in text:
+                    size = text
+                    break
+        except:
+            pass
+
+    return name, size
 
     # 3. Fallback: outer container and inner flex-1
     try:
