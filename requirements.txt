@@ -1,4 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 selenium
-pydantic
+webdriver-manager
+firebase-admin
